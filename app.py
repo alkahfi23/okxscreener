@@ -6,6 +6,7 @@ import time
 import os
 import random
 import numpy as np
+import psycopg2
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from datetime import datetime, timezone, timedelta
@@ -36,10 +37,6 @@ MAX_SCAN_SYMBOLS = 120
 TP1_R = 0.8
 TP2_R = 2.0
 
-BASE_DIR = os.getcwd()
-SIGNAL_LOG_FILE = os.path.join(BASE_DIR, "signal_history.csv")
-TRADE_RESULT_FILE = os.path.join(BASE_DIR, "trade_results.csv")
-
 # =====================================================
 # TIMEZONE
 # =====================================================
@@ -48,14 +45,100 @@ def now_wib():
     return datetime.now(timezone.utc).astimezone(WIB).strftime("%Y-%m-%d %H:%M WIB")
 
 # =====================================================
-# PRIORITY
+# TELEGRAM
 # =====================================================
-PAIR_PRIORITY = {
-    "BCH-USDT": 5,
-    "WLFI-USDT": 4,
-    "ZEC-USDT": 3,
-    "PEPE-USDT": 2
-}
+def send_telegram(msg):
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    chat = os.getenv("TELEGRAM_CHAT_ID")
+    if not token or not chat:
+        return
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={"chat_id": chat, "text": msg, "parse_mode": "Markdown"},
+            timeout=10
+        )
+    except:
+        pass
+
+# =====================================================
+# DATABASE
+# =====================================================
+def get_db():
+    return psycopg2.connect(os.getenv("DATABASE_URL"))
+
+def init_db():
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS signal_history (
+        time TEXT,
+        symbol TEXT,
+        phase TEXT,
+        candle TEXT,
+        entry REAL,
+        sl REAL,
+        tp1 REAL,
+        tp2 REAL,
+        priority INT,
+        rating TEXT,
+        status TEXT
+    );
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS trade_results (
+        time TEXT,
+        symbol TEXT,
+        r REAL
+    );
+    """)
+
+    conn.commit()
+    conn.close()
+
+def save_signal(sig):
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO signal_history VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+    """, tuple(sig.values()))
+    conn.commit()
+    conn.close()
+
+def load_signal_history():
+    conn = get_db()
+    df = pd.read_sql("SELECT * FROM signal_history ORDER BY time DESC", conn)
+    conn.close()
+    return df
+
+def has_open_signal(symbol):
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT 1 FROM signal_history
+        WHERE symbol=%s AND status='OPEN'
+        LIMIT 1
+    """, (symbol,))
+    res = cur.fetchone()
+    conn.close()
+    return res is not None
+
+def save_trade_result(symbol, r):
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO trade_results VALUES (%s,%s,%s)
+    """, (now_wib(), symbol, r))
+    conn.commit()
+    conn.close()
+
+def load_trade_results():
+    conn = get_db()
+    df = pd.read_sql("SELECT * FROM trade_results", conn)
+    conn.close()
+    return df
 
 # =====================================================
 # CCXT
@@ -65,81 +148,51 @@ def get_okx():
     return ccxt.okx({"enableRateLimit": True})
 
 # =====================================================
-# FILE HANDLERS
-# =====================================================
-def load_signal_history():
-    if not os.path.exists(SIGNAL_LOG_FILE):
-        df = pd.DataFrame(columns=[
-            "Time","Symbol","Phase","Candle",
-            "Entry","SL","TP1","TP2",
-            "Priority","Rating","Status"
-        ])
-        df.to_csv(SIGNAL_LOG_FILE, index=False)
-    return pd.read_csv(SIGNAL_LOG_FILE)
-
-def save_signal(signal):
-    df = load_signal_history()
-    df = pd.concat([df, pd.DataFrame([signal])], ignore_index=True)
-    df.to_csv(SIGNAL_LOG_FILE, index=False)
-
-def has_open_signal(symbol):
-    df = load_signal_history()
-    return ((df["Symbol"] == symbol) & (df["Status"] == "OPEN")).any()
-
-def load_trade_results():
-    if not os.path.exists(TRADE_RESULT_FILE):
-        df = pd.DataFrame(columns=["Time","Symbol","R"])
-        df.to_csv(TRADE_RESULT_FILE, index=False)
-    return pd.read_csv(TRADE_RESULT_FILE)
-
-# =====================================================
-# AUTO UPDATE R FROM TP / SL
+# AUTO UPDATE R
 # =====================================================
 def update_trade_outcomes(okx):
-    history = load_signal_history()
-    if history.empty:
+    df = load_signal_history()
+    if df.empty:
         return
 
-    results = load_trade_results()
-    updated = False
-
-    for i, row in history.iterrows():
-        if row["Status"] != "OPEN":
+    for i, row in df.iterrows():
+        if row["status"] != "OPEN":
             continue
 
         try:
-            price = okx.fetch_ticker(row["Symbol"])["last"]
+            price = okx.fetch_ticker(row["symbol"])["last"]
         except:
             continue
 
         r = None
         status = None
 
-        if price <= row["SL"]:
+        if price <= row["sl"]:
             r, status = -1, "SL HIT"
-        elif price >= row["TP2"]:
+        elif price >= row["tp2"]:
             r, status = TP2_R, "TP2 HIT"
-        elif price >= row["TP1"]:
+        elif price >= row["tp1"]:
             r, status = TP1_R, "TP1 HIT"
 
         if r is not None:
-            history.at[i, "Status"] = status
-            results = pd.concat([
-                results,
-                pd.DataFrame([{
-                    "Time": now_wib(),
-                    "Symbol": row["Symbol"],
-                    "R": r
-                }])
-            ], ignore_index=True)
-            updated = True
+            conn = get_db()
+            cur = conn.cursor()
+            cur.execute("""
+                UPDATE signal_history
+                SET status=%s
+                WHERE symbol=%s AND status='OPEN'
+            """, (status, row["symbol"]))
+            conn.commit()
+            conn.close()
 
-    if updated:
-        history.to_csv(SIGNAL_LOG_FILE, index=False)
-        results.to_csv(TRADE_RESULT_FILE, index=False)
+            save_trade_result(row["symbol"], r)
+
+            send_telegram(
+                f"📉 *TRADE CLOSED*\n{row['symbol']}\nStatus: *{status}*\nR: *{r}R*"
+            )
 
 # =====================================================
-# SYMBOL FETCH
+# MARKET DATA
 # =====================================================
 @st.cache_data(ttl=300)
 def get_liquid_symbols(min_vol):
@@ -160,15 +213,15 @@ def get_liquid_symbols(min_vol):
 # INDICATORS
 # =====================================================
 def supertrend(df, period, mult):
-    h,l,c = df.high, df.low, df.close
-    tr = pd.concat([h-l,(h-c.shift()).abs(),(l-c.shift()).abs()],axis=1).max(axis=1)
-    atr = tr.ewm(span=period,adjust=False).mean()
-    hl2 = (h+l)/2
-    upper = hl2 + mult*atr
-    lower = hl2 - mult*atr
+    h,l,c=df.high,df.low,df.close
+    tr=pd.concat([h-l,(h-c.shift()).abs(),(l-c.shift()).abs()],axis=1).max(axis=1)
+    atr=tr.ewm(span=period,adjust=False).mean()
+    hl2=(h+l)/2
+    upper=hl2+mult*atr
+    lower=hl2-mult*atr
 
-    stl = pd.Series(index=df.index,dtype=float)
-    trend = pd.Series(index=df.index,dtype=int)
+    stl=pd.Series(index=df.index,dtype=float)
+    trend=pd.Series(index=df.index,dtype=int)
     trend.iloc[0]=1
     stl.iloc[0]=lower.iloc[0]
 
@@ -191,188 +244,91 @@ def accumulation_distribution(df):
     return (mfm*v).cumsum()
 
 def ad_phase(adl, lookback=10):
-    slope = adl.iloc[-1] - adl.iloc[-lookback]
-    avg = adl.diff().rolling(lookback).mean().iloc[-1]
-    strength = slope / (abs(avg) + 1e-9)
-    if slope > 0:
-        return "AKUMULASI_KUAT" if strength > 2 else "AKUMULASI_LEMAH"
-    if slope < 0:
+    slope=adl.iloc[-1]-adl.iloc[-lookback]
+    avg=adl.diff().rolling(lookback).mean().iloc[-1]
+    strength=slope/(abs(avg)+1e-9)
+    if slope>0:
+        return "AKUMULASI_KUAT" if strength>2 else "AKUMULASI_LEMAH"
+    if slope<0:
         return "DISTRIBUSI"
     return "NETRAL"
 
 # =====================================================
-# PRICE ACTION & SUPPORT
-# =====================================================
-def detect_candle(df):
-    o,h,l,c=df.open,df.high,df.low,df.close
-    body=abs(c-o); rng=h-l
-    if rng.iloc[-1]<df.high.iloc[-20:].mean()*0.3: return "Normal"
-    if c.iloc[-1]>o.iloc[-1] and c.iloc[-2]<o.iloc[-2] and c.iloc[-1]>o.iloc[-2]:
-        return "Bullish Engulfing"
-    if c.iloc[-1]>o.iloc[-1] and (o.iloc[-1]-l.iloc[-1])>2*body.iloc[-1]:
-        return "Hammer"
-    if body.iloc[-1]/rng.iloc[-1]>0.65 and c.iloc[-1]>o.iloc[-1]:
-        return "Strong Bullish"
-    return "Normal"
-
-def find_support(df,lb):
-    raw=[]
-    for i in range(lb,len(df)-lb):
-        if df.low.iloc[i]==min(df.low.iloc[i-lb:i+lb+1]):
-            raw.append(df.low.iloc[i])
-    raw=sorted(set(raw))
-    filt=[]
-    for s in raw:
-        if not filt or abs(s-filt[-1])/s>0.01:
-            filt.append(s)
-    return filt
-
-# =====================================================
-# SIGNAL CHECK
-# =====================================================
-def check_signal(okx,symbol):
-    if has_open_signal(symbol):
-        return None
-
-    df4h=pd.DataFrame(okx.fetch_ohlcv(symbol,ENTRY_TF,limit=LIMIT_4H),
-        columns=["t","open","high","low","close","volume"])
-    df1d=pd.DataFrame(okx.fetch_ohlcv(symbol,SR_TF,limit=LIMIT_1D),
-        columns=["t","open","high","low","close","volume"])
-
-    stl,trend=supertrend(df4h,ATR_PERIOD,MULTIPLIER)
-    vo=volume_oscillator(df4h.volume,VO_FAST,VO_SLOW)
-    adl=accumulation_distribution(df4h)
-    phase=ad_phase(adl)
-
-    if trend.iloc[-1]!=1 or vo.iloc[-1]<VO_MIN or phase not in ["AKUMULASI_KUAT","AKUMULASI_LEMAH"]:
-        return None
-
-    ema200=df1d.close.ewm(span=200).mean()
-    if ema200.isna().iloc[-1] or df1d.close.iloc[-1]<ema200.iloc[-1]:
-        return None
-
-    entry=df4h.close.iloc[-1]
-    supports=[s for s in find_support(df1d,SR_LOOKBACK) if s<entry]
-    if not supports:
-        return None
-
-    sl=max(supports)*(1-ZONE_BUFFER)
-    if entry-sl<entry*0.002:
-        return None
-
-    risk=entry-sl
-    priority=PAIR_PRIORITY.get(symbol,3)
-    if phase=="AKUMULASI_KUAT":
-        priority=min(priority+1,5)
-
-    return {
-        "Time":now_wib(),"Symbol":symbol,"Phase":phase,
-        "Candle":detect_candle(df4h),
-        "Entry":round(entry,8),"SL":round(sl,8),
-        "TP1":round(entry+risk*TP1_R,8),
-        "TP2":round(entry+risk*TP2_R,8),
-        "Priority":priority,"Rating":"⭐"*priority,
-        "Status":"OPEN"
-    }
-
-# =====================================================
-# CHART (ON-DEMAND)
-# =====================================================
-def get_chart_data(okx, symbol):
-    df4h = pd.DataFrame(
-        okx.fetch_ohlcv(symbol, ENTRY_TF, limit=100),
-        columns=["t","open","high","low","close","volume"]
-    )
-    stl,_ = supertrend(df4h, ATR_PERIOD, MULTIPLIER)
-    adl = accumulation_distribution(df4h)
-    return df4h, stl, adl
-
-def render_chart(df,stl,adl,signal):
-    fig=make_subplots(rows=2,cols=1,shared_xaxes=True,row_heights=[0.7,0.3])
-    fig.add_candlestick(x=df.index,open=df.open,high=df.high,low=df.low,close=df.close,row=1,col=1)
-    fig.add_trace(go.Scatter(x=df.index,y=stl,line=dict(color="lime"),name="Supertrend"),row=1,col=1)
-    fig.add_trace(go.Scatter(x=df.index,y=adl,line=dict(color="cyan"),name="A/D"),row=2,col=1)
-
-    for k,c in [("Entry","cyan"),("SL","red"),("TP1","orange"),("TP2","purple")]:
-        fig.add_hline(y=signal[k],line_color=c,row=1)
-
-    fig.update_layout(height=520,template="plotly_dark",xaxis_rangeslider_visible=False)
-    return fig
-
-# =====================================================
 # UI
 # =====================================================
-st.set_page_config("OPSI A PRO v3.6.1",layout="wide")
-st.title("🚀 OPSI A PRO v3.6.1 — PROGRESS + CHART FIX")
+st.set_page_config("OPSI A PRO v3.7", layout="wide")
+st.title("🚀 OPSI A PRO v3.7 — POSTGRES EDITION")
 
-tab1,tab2,tab3=st.tabs(["📡 Live Signal","📜 Riwayat","🎲 Monte Carlo"])
-okx=get_okx()
-
+okx = get_okx()
+init_db()
 update_trade_outcomes(okx)
+
+tab1, tab2, tab3 = st.tabs(["📡 Live Signal", "📜 Riwayat", "🎲 Monte Carlo"])
 
 with tab1:
     if st.button("🔍 Scan Live Signal"):
-        symbols = get_liquid_symbols(MIN_USDT_VOLUME)
-        total = len(symbols)
-
-        progress = st.progress(0)
+        syms = get_liquid_symbols(MIN_USDT_VOLUME)
+        prog = st.progress(0)
         status = st.empty()
-        signals = []
 
-        for i,s in enumerate(symbols,1):
-            status.text(f"Scanning {s} ({i}/{total})")
-            try:
-                sig = check_signal(okx,s)
-                if sig:
-                    save_signal(sig)
-                    signals.append(sig)
-            except:
-                pass
-            progress.progress(i/total)
+        found = []
+        for i,s in enumerate(syms,1):
+            status.text(f"{i}/{len(syms)} {s}")
+            if not has_open_signal(s):
+                try:
+                    df = pd.DataFrame(okx.fetch_ohlcv(s, ENTRY_TF, limit=200),
+                        columns=["t","open","high","low","close","volume"])
+                    stl,trend = supertrend(df, ATR_PERIOD, MULTIPLIER)
+                    vo = volume_oscillator(df.volume, VO_FAST, VO_SLOW)
+                    adl = accumulation_distribution(df)
+                    phase = ad_phase(adl)
+
+                    if trend.iloc[-1]==1 and vo.iloc[-1]>VO_MIN and phase=="AKUMULASI_KUAT":
+                        entry=df.close.iloc[-1]
+                        sl=df.low.iloc[-10:].min()
+                        risk=entry-sl
+                        sig={
+                            "time":now_wib(),"symbol":s,"phase":phase,
+                            "candle":"Normal",
+                            "entry":round(entry,8),
+                            "sl":round(sl,8),
+                            "tp1":round(entry+risk*TP1_R,8),
+                            "tp2":round(entry+risk*TP2_R,8),
+                            "priority":4,
+                            "rating":"⭐⭐⭐⭐",
+                            "status":"OPEN"
+                        }
+                        save_signal(sig)
+                        found.append(sig)
+                        send_telegram(f"🚀 *NEW SIGNAL*\n{s}\nEntry: {sig['entry']}")
+                except:
+                    pass
+            prog.progress(i/len(syms))
             time.sleep(RATE_LIMIT_DELAY)
 
-        progress.empty()
-        status.empty()
-
-        if signals:
-            st.success(f"🔥 {len(signals)} SIGNAL DITEMUKAN")
-            st.dataframe(pd.DataFrame(signals),use_container_width=True)
-
-            for sig in signals:
-                with st.expander(f"📈 {sig['Symbol']} — Chart"):
-                    with st.spinner("Loading chart..."):
-                        dfc,stlc,adlc = get_chart_data(okx, sig["Symbol"])
-                        st.plotly_chart(render_chart(dfc,stlc,adlc,sig),use_container_width=True)
-        else:
-            st.warning("Tidak ada setup valid.")
+        prog.empty(); status.empty()
+        st.success(f"{len(found)} signal ditemukan")
 
 with tab2:
-    st.dataframe(load_signal_history(),use_container_width=True)
+    st.dataframe(load_signal_history(), use_container_width=True)
 
 with tab3:
-    df_r=load_trade_results()
+    df_r = load_trade_results()
     if df_r.empty:
         st.info("Belum ada trade closed.")
     else:
-        r=df_r["R"].values
-        risk=st.slider("Risk / Trade (%)",0.2,3.0,1.0)/100
-        trades=st.slider("Trades / Simulation",50,500,300)
+        r = df_r["r"].values
+        curves=[]
+        for _ in range(500):
+            bal=10000; eq=[bal]
+            for _ in range(200):
+                bal+=bal*0.01*np.random.choice(r)
+                eq.append(bal)
+            curves.append(eq)
+        curves=np.array(curves)
 
-        if st.button("Run Monte Carlo"):
-            curves=[]
-            for _ in range(1000):
-                bal=10000; eq=[bal]
-                for _ in range(trades):
-                    bal+=bal*risk*np.random.choice(r)
-                    eq.append(bal)
-                curves.append(eq)
-            curves=np.array(curves)
-
-            st.write(f"Median Final Balance: ${np.median(curves[:,-1]):,.0f}")
-            st.write(f"Ruin Probability: {(curves[:,-1]<5000).mean()*100:.2f}%")
-
-            fig=go.Figure()
-            for i in range(min(50,len(curves))):
-                fig.add_trace(go.Scatter(y=curves[i],mode="lines",opacity=0.3,showlegend=False))
-            fig.update_layout(template="plotly_dark",height=400)
-            st.plotly_chart(fig,use_container_width=True)
+        fig=go.Figure()
+        for i in range(min(30,len(curves))):
+            fig.add_trace(go.Scatter(y=curves[i],mode="lines",opacity=0.3))
+        fig.update_layout(template="plotly_dark",height=400)
+        st.plotly_chart(fig,use_container_width=True)
