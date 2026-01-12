@@ -4,4 +4,6 @@ pandas
 numpy
 requests
 plotly
+psycopg2-binary
+
 
